@@ -3,6 +3,7 @@ Jeffrey Tool Executor
 Each function maps to an action the LLM can trigger.
 All return a dict: {"ok": bool, "result": str}
 """
+import os
 import subprocess
 import time
 
@@ -118,9 +119,24 @@ def play_spotify(query: str = "", uri: str = "", action: str = "play", **_) -> d
     return {"ok": ok, "result": "Spotify reproduciendo."}
 
 
+MAX_VOLUME = 70   # safety cap: never blast the speakers on a voice command
+
+
 def set_volume(level: int, **_) -> dict:
-    """Volume control is disabled for safety."""
-    return {"ok": False, "result": "El control de volumen está desactivado."}
+    """Set system output volume 0-100 (capped at MAX_VOLUME)."""
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        return {"ok": False, "result": "Dime un nivel de volumen entre 0 y 100."}
+
+    level = max(0, min(level, 100))
+    capped = min(level, MAX_VOLUME)
+    ok, out = _osascript(f"set volume output volume {capped}")
+    if not ok:
+        return {"ok": False, "result": f"No pude cambiar el volumen: {out}"}
+    if capped < level:
+        return {"ok": True, "result": f"Volumen al {capped}% (limitado por seguridad)."}
+    return {"ok": True, "result": f"Volumen al {capped}%."}
 
 
 def type_text(text: str, app: str = "", **_) -> dict:
@@ -162,19 +178,48 @@ def list_shortcuts(**_) -> dict:
     return {"ok": True, "result": "Shortcuts disponibles:\n" + "\n".join(f"• {n}" for n in names)}
 
 
+# Read-only commands Jeffrey may run. Allow-list beats block-list: the previous
+# version used shell=True with a 6-item blacklist, trivially bypassed
+# ("RM -RF", "rm  -rf", $(...), backticks) — and it's an 8B model deciding.
+_SHELL_ALLOW = {
+    "ls", "pwd", "whoami", "date", "uptime", "df", "du", "cat", "head", "tail",
+    "wc", "grep", "find", "which", "echo", "hostname", "sw_vers", "uname",
+    "ps", "top", "networksetup", "ifconfig", "ping", "curl", "sysctl",
+    "git", "python3", "node", "npm", "brew", "defaults", "system_profiler",
+    "pmset", "ioreg", "osascript", "open", "shortcuts", "pbpaste", "mdfind",
+}
+
+
 def run_shell(cmd: str, **_) -> dict:
-    """Run a safe shell command and return output."""
-    # Basic safety: block destructive commands
-    BLOCKED = ["rm -rf", "sudo", "mkfs", "dd if=", "> /dev/", "chmod 777"]
-    for b in BLOCKED:
-        if b in cmd.lower():
-            return {"ok": False, "result": f"Comando bloqueado por seguridad: {b}"}
+    """
+    Run a shell command from an allow-list, without a shell interpreter.
+    No pipes/redirects/substitution — those are what made the old version unsafe.
+    """
+    import shlex
     try:
-        r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=15
-        )
+        parts = shlex.split(cmd)
+    except ValueError:
+        return {"ok": False, "result": "Comando mal formado."}
+    if not parts:
+        return {"ok": False, "result": "Comando vacío."}
+
+    # Reject shell metacharacters outright (no shell is used anyway)
+    if any(ch in cmd for ch in ["|", ";", "&", ">", "<", "`", "$("]):
+        return {"ok": False, "result": "Por seguridad no ejecuto tuberías ni redirecciones."}
+
+    program = os.path.basename(parts[0])
+    if program not in _SHELL_ALLOW:
+        return {"ok": False, "result": f"'{program}' no está en la lista de comandos permitidos."}
+
+    # No shell means no tilde expansion — do it ourselves for path-like args.
+    parts = [os.path.expanduser(p) if p.startswith("~") else p for p in parts]
+
+    try:
+        r = subprocess.run(parts, capture_output=True, text=True, timeout=15)
         out = (r.stdout + r.stderr).strip()[:500]
         return {"ok": r.returncode == 0, "result": out or "Ejecutado sin output."}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "result": "El comando tardó demasiado."}
     except Exception as e:
         return {"ok": False, "result": str(e)}
 
@@ -756,32 +801,39 @@ def weather(location: str = "", **_) -> dict:
 
 
 def translate(text: str, target: str = "en", **_) -> dict:
-    """Translate text via Lingva (free, no key)."""
+    """
+    Translate text. Google endpoint first (fast, reliable); Lingva only as a
+    short-timeout backup — lingva.ml is frequently down and used to burn 10s
+    before we even tried Google (whole call took ~20s).
+    """
     import requests
-    try:
-        # Detect source automatically
-        r = requests.get(
-            f"https://lingva.ml/api/v1/auto/{target}/{requests.utils.quote(text)}",
-            timeout=10
-        )
-        if r.ok:
-            data = r.json()
-            return {"ok": True, "result": data.get("translation", "").strip() or text}
-    except Exception:
-        pass
-    # Fallback: Google Translate via translate.google.com (lightweight)
+    # 1) Google (free gtx endpoint) — usually <500ms
     try:
         r = requests.get(
             "https://translate.googleapis.com/translate_a/single",
             params={"client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text},
-            timeout=10
+            timeout=4,
         )
         if r.ok:
             j = r.json()
-            return {"ok": True, "result": "".join(seg[0] for seg in j[0])}
-    except Exception as e:
-        return {"ok": False, "result": str(e)}
-    return {"ok": False, "result": "No pude traducir."}
+            out = "".join(seg[0] for seg in j[0]).strip()
+            if out:
+                return {"ok": True, "result": out}
+    except Exception:
+        pass
+    # 2) Lingva backup — short timeout so a dead host can't stall us
+    try:
+        r = requests.get(
+            f"https://lingva.ml/api/v1/auto/{target}/{requests.utils.quote(text)}",
+            timeout=3,
+        )
+        if r.ok:
+            out = (r.json().get("translation") or "").strip()
+            if out:
+                return {"ok": True, "result": out}
+    except Exception:
+        pass
+    return {"ok": False, "result": "No pude traducir ahora mismo."}
 
 
 def define_word(word: str, **_) -> dict:

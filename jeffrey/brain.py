@@ -13,7 +13,7 @@ NVIDIA_URL     = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_MODELS  = [
     "meta/llama-3.1-8b-instruct",                # primary: ~1s. Forced tool_choice stops hallucination
     "meta/llama-3.3-70b-instruct",               # fallback 1: smarter
-    "mistralai/mistral-large-2-instruct",        # fallback 2: great spanish
+    "meta/llama-3.1-70b-instruct",               # fallback 2 (mistral-large-2 404s on this endpoint)
 ]
 NVIDIA_FAST_MODEL = "meta/llama-3.1-8b-instruct"  # quick model for summarizing tool results
 
@@ -28,7 +28,9 @@ def _get_nvidia_key() -> str | None:
 
 # ── Gemini config ─────────────────────────────────────────────────────────────
 # Google AI Studio: https://aistudio.google.com/apikey  (free, 1500 req/day)
-GEMINI_MODEL  = "gemini-2.0-flash"
+# NOTE: "gemini-2.0-flash" was retired — it returned 404 on every call, which
+# looked like an exhausted quota. 2.5-flash is the current fast model.
+GEMINI_MODEL  = "gemini-2.5-flash"
 GEMINI_URL    = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 def _get_gemini_key() -> str | None:
@@ -65,7 +67,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "open_app",
-            "description": "Open or focus a macOS application",
+            "description": "Open or focus an INSTALLED macOS application (Safari, Notes, Spotify…). NOT for websites — for a website use open_url, and to search the web use web_search.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -205,6 +207,20 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            "description": "Set the Mac system volume (0-100). Use for 'sube el volumen', 'baja el volumen', 'silencio', 'pon el sonido al 50'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {"type": "integer", "description": "0 = mute, 100 = max"}
+                },
+                "required": ["level"]
             }
         }
     },
@@ -547,8 +563,19 @@ TOOLS = [
 ]
 
 
-def _build_system_prompt() -> str:
-    """Build system prompt with persona + live app list."""
+# Cache for the system prompt: rebuilding it scans installed + running apps
+# (~0.2s) and that was happening on EVERY message.
+_SYS_CACHE: dict = {"text": None, "ts": 0.0}
+_SYS_TTL = 60.0   # seconds
+
+
+def _build_system_prompt(force: bool = False) -> str:
+    """System prompt with persona + live app list. Cached for _SYS_TTL seconds."""
+    import time as _t
+    now = _t.time()
+    if not force and _SYS_CACHE["text"] and (now - _SYS_CACHE["ts"]) < _SYS_TTL:
+        return _SYS_CACHE["text"]
+
     # Personal context
     persona_file = Path.home() / ".jeffrey" / "persona.md"
     try:
@@ -565,7 +592,10 @@ def _build_system_prompt() -> str:
     except Exception:
         app_block = ""
 
-    return SYSTEM_PROMPT + persona_block + app_block
+    text = SYSTEM_PROMPT + persona_block + app_block
+    _SYS_CACHE["text"] = text
+    _SYS_CACHE["ts"]   = now
+    return text
 
 
 # ── Shared OpenAI-compat caller ───────────────────────────────────────────────
@@ -621,7 +651,8 @@ def _call_openai_compat(url: str, key: str, model: str, messages: list[dict],
         return {"text": None, "tool_call": None, "error": str(e)}
 
 
-def _chat_nvidia(messages: list[dict], force_tools: bool = False, use_tools: bool = True) -> dict:
+def _chat_nvidia(messages: list[dict], force_tools: bool = False, use_tools: bool = True,
+                 tools: list | None = None) -> dict:
     """
     Try NVIDIA NIM models in order.
     - force_tools=True  → tool_choice='required' (8B must call a tool, no hallucination)
@@ -631,13 +662,15 @@ def _chat_nvidia(messages: list[dict], force_tools: bool = False, use_tools: boo
     if not key:
         return {"text": None, "tool_call": None, "error": "no_key"}
 
-    tools = TOOLS if use_tools else None
-    tc    = "required" if (force_tools and use_tools) else None
+    # `tools` may be a pre-filtered subset (progressive disclosure).
+    send_tools = (tools if tools is not None else TOOLS) if use_tools else None
+    tc = "required" if (force_tools and use_tools) else None
     for model in NVIDIA_MODELS:
-        result = _call_openai_compat(NVIDIA_URL, key, model, messages, tools=tools, tool_choice=tc)
+        result = _call_openai_compat(NVIDIA_URL, key, model, messages, tools=send_tools, tool_choice=tc)
         if result["error"] is None:
             tag = " [forced tool]" if tc else (" [chat]" if not use_tools else "")
-            print(f"[jeffrey] Backend: NVIDIA {model.split('/')[-1]}{tag}")
+            n = f" {len(send_tools)}t" if send_tools else ""
+            print(f"[jeffrey] Backend: NVIDIA {model.split('/')[-1]}{tag}{n}")
             return result
         err = result["error"]
         if err in ("no_credits", "quota"):
@@ -656,7 +689,7 @@ def _chat_gemini(messages: list[dict]) -> dict:
         return {"text": None, "tool_call": None, "error": "no_key"}
     result = _call_openai_compat(GEMINI_URL, key, GEMINI_MODEL, messages, tools=TOOLS)
     if result["error"] is None:
-        print("[jeffrey] Backend: Gemini 2.0 Flash")
+        print(f"[jeffrey] Backend: Gemini {GEMINI_MODEL}")
     return result
 
 
@@ -792,10 +825,20 @@ def chat(
     user_message: str,
     history: list[dict] | None = None,
     model: str = DEFAULT_MODEL,
+    exclude_tools: set | None = None,
+    allow_no_tool: bool = False,
 ) -> dict:
     """
-    Send a message. Tries Gemini first, falls back to Ollama.
+    Send a message. Tries NVIDIA → Gemini → Ollama.
     Returns {"text": str, "tool_call": dict | None}
+
+    exclude_tools: tool names already executed in this request. Removing them
+    stops a small model from re-calling the same tool on a follow-up step
+    instead of moving on to the pending action.
+
+    allow_no_tool: never use tool_choice='required'. Needed on follow-up steps:
+    forcing a call there makes the model invent a random action once the
+    request is already satisfied.
     """
     system   = _build_system_prompt()
     messages = [{"role": "system", "content": system}]
@@ -803,14 +846,33 @@ def chat(
         messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
+
     # Greetings/small talk AND meta questions ("how do you generate images?")
-    # → pure chat (no tools). Everything else → force a tool so the fast 8B model
-    # can't invent times, prices, etc.
-    no_tools    = _is_chitchat(user_message) or _is_meta_question(user_message)
-    force_tools = not no_tools
+    # → pure chat (no tools).
+    no_tools = _is_chitchat(user_message) or _is_meta_question(user_message)
+
+    # ── Progressive disclosure + confidence + token budget ────────────────────
+    # Instead of shipping all 86 schemas (~5.5k tokens) on every message, score
+    # them against the message and send only what's relevant (~600 tokens).
+    # If nothing scores well the request is ambiguous → don't force a tool,
+    # let the model ask instead of guessing.
+    selected_tools = None
+    force_tools    = False
+    if not no_tools:
+        try:
+            from jeffrey.tool_router import select_tools, is_confident
+            pool = [t for t in TOOLS if t['function']['name'] not in (exclude_tools or set())]
+            selected_tools, best = select_tools(user_message, pool)
+            force_tools = is_confident(best) and not allow_no_tool
+            if not force_tools:
+                print(f"[jeffrey] Petición ambigua (score {best:.1f}) → no fuerzo tool")
+        except Exception as e:
+            print(f"[jeffrey] tool_router no disponible ({e}) → uso todos los tools")
+            selected_tools, force_tools = None, True
 
     # 1️⃣ NVIDIA NIM (8B fast → 70B → mistral)
-    nvidia = _chat_nvidia(messages, force_tools=force_tools, use_tools=not no_tools)
+    nvidia = _chat_nvidia(messages, force_tools=force_tools,
+                          use_tools=not no_tools, tools=selected_tools)
     if nvidia["error"] is None:
         return {"text": nvidia["text"], "tool_call": nvidia["tool_call"]}
     print(f"[jeffrey] NVIDIA failed ({nvidia['error']}) → Gemini")

@@ -357,7 +357,7 @@ def generate_image(prompt: str, **_) -> dict:
     try:
         from urllib.parse import quote
         r = requests.get(f"https://image.pollinations.ai/prompt/{quote(prompt)}",
-                         params={"width": 1024, "height": 1024, "nologo": "true"}, timeout=60)
+                         params={"width": 1024, "height": 1024, "nologo": "true"}, timeout=25)
         if r.ok and r.content:
             with open(out, "wb") as f:
                 f.write(r.content)
@@ -573,7 +573,13 @@ def window_arrange(position: str = "left", **_) -> dict:
 def find_large_files(base: str = "~", min_gb: float = 1.0, **_) -> dict:
     """Find largest files under base."""
     base = os.path.expanduser(base)
-    ok, out = _sh(["find", base, "-type", "f", "-size", f"+{int(min_gb*1024)}M"], timeout=30)
+    # -maxdepth + pruning heavy folders: unbounded find took ~5s here.
+    ok, out = _sh([
+        "find", base, "-maxdepth", "6",
+        "(", "-name", "node_modules", "-o", "-name", "DerivedData",
+             "-o", "-name", ".git", "-o", "-name", "Library", ")", "-prune", "-o",
+        "-type", "f", "-size", f"+{int(min_gb*1024)}M", "-print"
+    ], timeout=15)
     if not ok:
         return {"ok": False, "result": "No pude buscar."}
     files = out.splitlines()[:20]
@@ -689,7 +695,7 @@ def tell_joke(**_) -> dict:
     """Tell a joke."""
     if not requests: return {"ok": False, "result": "requests no disponible."}
     try:
-        r = requests.get("https://official-joke-api.appspot.com/random_joke", timeout=10)
+        r = requests.get("https://official-joke-api.appspot.com/random_joke", timeout=6)
         j = r.json()
         return {"ok": True, "result": f"{j.get('setup','')} … {j.get('punchline','')}"}
     except Exception as e:
